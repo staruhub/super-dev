@@ -586,9 +586,18 @@ class WorkflowEngine:
 
             # Overseer halt check
             if self.overseer and self.overseer.should_halt():
+                halt_reason = self.overseer.get_report().halt_reason
                 self.logger.warning(
-                    f'Overseer 要求暂停，在阶段 {phase.value} 开始前终止'
+                    f'Overseer 要求暂停，在阶段 {phase.value} 开始前终止: {halt_reason}'
                 )
+                results[phase] = PhaseResult(
+                    phase=phase,
+                    success=False,
+                    duration=0.0,
+                    errors=[halt_reason],
+                )
+                self._save_checkpoint(phase, results[phase], context)
+                self._emit_state_event("phase_failed", phase.value, error=halt_reason)
                 break
 
             try:
@@ -700,6 +709,72 @@ class WorkflowEngine:
                 if result.success:
                     self._save_checkpoint(phase, result, context)
 
+                self._emit_state_event(
+                    "phase_completed",
+                    phase.value,
+                    output=result.output,
+                    context=context,
+                    quality_score=result.quality_score,
+                )
+
+                try:
+                    review_phases = set(
+                        getattr(self.config_manager.config, "codex_review_phases", []) or []
+                    )
+                    if (
+                        self.plan_executor
+                        and self.overseer
+                        and getattr(self.config_manager.config, "codex_review_enabled", False)
+                        and phase.value in review_phases
+                    ):
+                        from types import SimpleNamespace
+
+                        review_step = SimpleNamespace(
+                            id=f"phase-{phase.value}",
+                            label=f"{phase.value} phase review",
+                            phase=phase.value,
+                            description=f"Review completed output for phase {phase.value}.",
+                        )
+                        review_context = json.dumps(
+                            {
+                                "phase": phase.value,
+                                "quality_score": result.quality_score,
+                                "output": result.output,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                            indent=2,
+                        )
+                        codex_review = self.plan_executor.request_codex_review(
+                            review_step, review_context
+                        )
+                        if not bool(codex_review.get("passed", True)):
+                            parsed_review = codex_review.get("parsed")
+                            issue_text = ""
+                            if isinstance(parsed_review, dict):
+                                parsed_issues = parsed_review.get("issues")
+                                if isinstance(parsed_issues, list) and parsed_issues:
+                                    issue_text = "; ".join(str(item) for item in parsed_issues)
+                                else:
+                                    issue_text = str(parsed_review.get("summary", "")).strip()
+                            self.overseer.checkpoint_phase(
+                                phase=phase.value,
+                                quality_score=result.quality_score,
+                                actual_output=result.output if isinstance(result.output, dict) else None,
+                                codex_reviews=[
+                                    {
+                                        "severity": codex_review.get("severity", "unknown"),
+                                        "issue": (
+                                            issue_text
+                                            or str(codex_review.get("error", "")).strip()
+                                            or "Codex review did not pass."
+                                        ),
+                                    }
+                                ],
+                            )
+                except Exception:
+                    pass
+
                 # Update pipeline state after phase completion
                 self._emit_pipeline_state(phase.value, phases, results)
 
@@ -785,6 +860,8 @@ class WorkflowEngine:
                 )
                 break
 
+        overseer_report = None
+
         # Finalize overseer report
         if self.overseer:
             try:
@@ -795,6 +872,22 @@ class WorkflowEngine:
                 )
             except Exception as e:
                 self.logger.warning(f'Overseer 最终报告生成失败: {e}')
+
+        try:
+            if overseer_report is not None:
+                output_dir = self.project_dir / "output"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                name = str(
+                    context.user_input.get(
+                        "name", self.config_manager.config.name or self.project_dir.name
+                    )
+                )
+                (output_dir / f"{name}-overseer.md").write_text(
+                    overseer_report.to_markdown(),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
 
         # Session Brief: update status
         if SESSION_BRIEF_AVAILABLE:

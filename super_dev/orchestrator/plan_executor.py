@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import time
 import uuid
@@ -23,6 +24,39 @@ from typing import Any, Mapping, Sequence
 
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_EXECUTORS = {"claude-code", "codex", "auto"}
+ALLOWED_GATE_COMMANDS: set[str] = {
+    "npm",
+    "npx",
+    "node",
+    "python",
+    "python3",
+    "pytest",
+    "pip",
+    "go",
+    "cargo",
+    "rustc",
+    "javac",
+    "java",
+    "mvn",
+    "gradle",
+    "make",
+    "cmake",
+    "tsc",
+    "eslint",
+    "prettier",
+    "jest",
+    "vitest",
+    "ruff",
+    "mypy",
+    "black",
+    "flake8",
+    "pylint",
+    "isort",
+    "super-dev",
+    "git",
+    "docker",
+    "kubectl",
+}
 
 
 def _utcnow() -> datetime:
@@ -288,6 +322,22 @@ class PlanExecutor:
                 ready_steps.append(step)
         return ready_steps
 
+    @staticmethod
+    def _validate_gate_command(command: str) -> tuple[list[str], str]:
+        forbidden_chars = {"|", ";", "&", "`", "$", "(", ")", "<", ">", "\n"}
+        if any(char in command for char in forbidden_chars):
+            return [], "Command contains forbidden shell metacharacters"
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            return [], f"Invalid command syntax: {exc}"
+        if not argv:
+            return [], "Command is empty"
+        executable = argv[0].split("/")[-1]
+        if executable not in ALLOWED_GATE_COMMANDS:
+            return [], f"Executable '{executable}' is not in the allowlist"
+        return argv, ""
+
     def run_verify_gates(
         self,
         step: PlanStep,
@@ -299,10 +349,28 @@ class PlanExecutor:
 
         for gate in step.verify_gates:
             started = time.monotonic()
+            argv, validation_error = self._validate_gate_command(gate.command)
+            if validation_error:
+                result = {
+                    "gate": gate.gate,
+                    "command": gate.command,
+                    "required": gate.required,
+                    "timeout_seconds": gate.timeout_seconds,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "passed": False,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": f"Verify gate command rejected: {validation_error}",
+                }
+                if gate.required:
+                    all_required_passed = False
+                results.append(result)
+                continue
             try:
                 completed = subprocess.run(
-                    gate.command,
-                    shell=True,
+                    argv,
+                    shell=False,
                     cwd=str(cwd),
                     capture_output=True,
                     text=True,
@@ -458,10 +526,16 @@ class PlanExecutor:
             LOGGER.exception("Failed to load plan from %s", plan_path)
             return None
         try:
-            return self._dict_to_plan(payload)
+            plan = self._dict_to_plan(payload)
         except (KeyError, TypeError, ValueError):
             LOGGER.exception("Failed to deserialize plan from %s", plan_path)
             return None
+        LOGGER.info(
+            "Loaded plan %s from %s; verify gates will be validated against the command allowlist",
+            plan.plan_id,
+            plan_path,
+        )
+        return plan
 
     def list_plans(self) -> list[dict[str, Any]]:
         plans: list[dict[str, Any]] = []
